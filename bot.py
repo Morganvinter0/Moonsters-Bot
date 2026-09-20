@@ -29,7 +29,7 @@ class ScanBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.db.connect()
-        for cog in ("cogs.obras", "cogs.capitulos", "cogs.ranking"):
+        for cog in ("cogs.obras", "cogs.capitulos", "cogs.ranking", "cogs.painel"):
             await self.load_extension(cog)
             log.info("Cog carregado: %s", cog)
 

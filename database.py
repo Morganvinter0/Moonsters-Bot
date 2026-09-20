@@ -74,6 +74,27 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_obras_guild ON obras(guild_id);
             CREATE INDEX IF NOT EXISTS idx_caps_obra ON capitulos(obra_id, status);
             CREATE INDEX IF NOT EXISTS idx_etapas_user ON etapas(user_id);
+
+            CREATE TABLE IF NOT EXISTS equipes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                nome TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(guild_id, nome)
+            );
+
+            CREATE TABLE IF NOT EXISTS equipe_membros (
+                equipe_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_name TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY(equipe_id, user_id),
+                FOREIGN KEY(equipe_id) REFERENCES equipes(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_equipes_guild ON equipes(guild_id);
+            CREATE INDEX IF NOT EXISTS idx_equipe_membros_user ON equipe_membros(user_id);
             """
         )
         await self.db.commit()
@@ -381,6 +402,75 @@ class Database:
             (guild_id, tipo, limit),
         )
         return await cur.fetchall()
+
+
+    # ── equipes / dashboards ─────────────────────────────
+    async def add_equipe(self, guild_id: int, nome: str, created_by: int) -> dict[str, Any]:
+        assert self.db
+        cur = await self.db.execute(
+            "INSERT INTO equipes (guild_id, nome, created_by, created_at) VALUES (?, ?, ?, ?)",
+            (guild_id, nome.strip(), created_by, _now()),
+        )
+        await self.db.commit()
+        return {"id": cur.lastrowid, "guild_id": guild_id, "nome": nome.strip()}
+
+    async def get_equipe(self, guild_id: int, nome: str):
+        assert self.db
+        cur = await self.db.execute(
+            "SELECT * FROM equipes WHERE guild_id = ? AND LOWER(nome) = LOWER(?)",
+            (guild_id, nome.strip()),
+        )
+        row = await cur.fetchone()
+        if row: return row
+        cur = await self.db.execute(
+            "SELECT * FROM equipes WHERE guild_id = ? AND LOWER(nome) LIKE LOWER(?) ORDER BY nome LIMIT 1",
+            (guild_id, f"%{nome.strip()}%"),
+        )
+        return await cur.fetchone()
+
+    async def list_equipes(self, guild_id: int):
+        assert self.db
+        cur = await self.db.execute("SELECT * FROM equipes WHERE guild_id = ? ORDER BY nome", (guild_id,))
+        return await cur.fetchall()
+
+    async def add_membro_equipe(self, equipe_id: int, user_id: int, user_name: str) -> None:
+        assert self.db
+        await self.db.execute(
+            "INSERT OR REPLACE INTO equipe_membros (equipe_id,user_id,user_name,added_at) VALUES (?,?,?,?)",
+            (equipe_id, user_id, user_name, _now()),
+        )
+        await self.db.commit()
+
+    async def membros_equipe(self, equipe_id: int):
+        assert self.db
+        cur = await self.db.execute("SELECT * FROM equipe_membros WHERE equipe_id = ? ORDER BY user_name", (equipe_id,))
+        return await cur.fetchall()
+
+    async def stats_equipe(self, equipe_id: int, since: str | None = None):
+        assert self.db
+        if since:
+            q = """SELECT e.user_id,e.user_name,COUNT(*) total FROM equipe_membros m JOIN etapas e ON e.user_id=m.user_id JOIN capitulos c ON c.id=e.capitulo_id JOIN obras o ON o.id=c.obra_id WHERE m.equipe_id=? AND o.guild_id=(SELECT guild_id FROM equipes WHERE id=?) AND e.completed_at>=? GROUP BY e.user_id ORDER BY total DESC"""
+            args=(equipe_id,equipe_id,since)
+        else:
+            q = """SELECT e.user_id,e.user_name,COUNT(*) total FROM equipe_membros m JOIN etapas e ON e.user_id=m.user_id JOIN capitulos c ON c.id=e.capitulo_id JOIN obras o ON o.id=c.obra_id WHERE m.equipe_id=? AND o.guild_id=(SELECT guild_id FROM equipes WHERE id=?) GROUP BY e.user_id ORDER BY total DESC"""
+            args=(equipe_id,equipe_id)
+        cur=await self.db.execute(q,args); return await cur.fetchall()
+
+    async def user_stats(self, guild_id: int, user_id: int):
+        assert self.db
+        cur=await self.db.execute("""SELECT COUNT(*) total, COUNT(DISTINCT c.id) capitulos, COUNT(DISTINCT o.id) obras FROM etapas e JOIN capitulos c ON c.id=e.capitulo_id JOIN obras o ON o.id=c.obra_id WHERE o.guild_id=? AND e.user_id=?""",(guild_id,user_id)); return await cur.fetchone()
+
+    async def user_etapas(self, guild_id: int, user_id: int):
+        assert self.db
+        cur=await self.db.execute("""SELECT e.tipo,COUNT(*) total FROM etapas e JOIN capitulos c ON c.id=e.capitulo_id JOIN obras o ON o.id=c.obra_id WHERE o.guild_id=? AND e.user_id=? GROUP BY e.tipo ORDER BY total DESC""",(guild_id,user_id)); return await cur.fetchall()
+
+    async def dashboard_stats(self, guild_id: int):
+        assert self.db
+        cur=await self.db.execute("""SELECT COUNT(*) total_caps, SUM(CASE WHEN c.status='aberto' THEN 1 ELSE 0 END) abertos, SUM(CASE WHEN c.status='fechado' THEN 1 ELSE 0 END) fechados, COUNT(DISTINCT o.id) obras FROM capitulos c JOIN obras o ON o.id=c.obra_id WHERE o.guild_id=?""",(guild_id,)); return await cur.fetchone()
+
+    async def etapas_periodo(self, guild_id: int, since: str):
+        assert self.db
+        cur=await self.db.execute("""SELECT COUNT(*) total FROM etapas e JOIN capitulos c ON c.id=e.capitulo_id JOIN obras o ON o.id=c.obra_id WHERE o.guild_id=? AND e.completed_at>=?""",(guild_id,since)); return (await cur.fetchone())["total"] or 0
 
     async def stats_obra(self, obra_id: int) -> dict[str, int]:
         assert self.db

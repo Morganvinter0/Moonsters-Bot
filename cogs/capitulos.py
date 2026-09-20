@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -38,15 +40,25 @@ class Capitulos(commands.Cog):
 
     @app_commands.command(
         name="cap",
-        description="Registra sua etapa em um capítulo (cria o cap se ainda não existir)",
+        description="Registra uma etapa em um ou vários capítulos/obras",
     )
     @app_commands.describe(
-        obra="Sigla ou nome da obra",
-        capitulo="Número do capítulo (ex: 101 ou 101.5)",
+        obra=(
+            "Obra. Para várias: OP:101,102; NAR:5,6. "
+            "Para uma: OP"
+        ),
         etapa="Etapa que você finalizou: RW, CL, TD, TL, RV, QA, QC",
+        capitulo=(
+            "Capítulo(s): 101 ou 101,102,103. "
+            "Pode ficar vazio ao usar OP:101,102;NAR:5,6"
+        ),
     )
     async def cap(
-        self, interaction: discord.Interaction, obra: str, capitulo: str, etapa: str
+        self,
+        interaction: discord.Interaction,
+        obra: str,
+        etapa: str,
+        capitulo: str | None = None,
     ):
         if not interaction.guild:
             return await interaction.response.send_message("Use no servidor.", ephemeral=True)
@@ -60,73 +72,189 @@ class Capitulos(commands.Cog):
                 f"Etapa `{etapa}` inválida. Use: {validas}", ephemeral=True
             )
 
-        row_obra = await self.bot.db.get_obra(interaction.guild.id, obra)  # type: ignore
-        if not row_obra:
+        try:
+            pares = self._parse_lote_cap(obra, capitulo)
+        except ValueError as exc:
             return await interaction.response.send_message(
-                f"Obra `{obra}` não encontrada. Cadastre com `/adc`.", ephemeral=True
+                f"Formato inválido: {exc}", ephemeral=True
             )
-        if row_obra["status"] != "ativa":
+
+        if not pares:
             return await interaction.response.send_message(
-                f"**{row_obra['sigla']}** está pausada.", ephemeral=True
+                "Informe pelo menos um capítulo.", ephemeral=True
             )
 
-        cap, criado = await self.bot.db.get_or_create_cap(  # type: ignore
-            row_obra["id"], capitulo, interaction.user.id
-        )
-        if cap["status"] == "fechado":
+        # Evita um comando acidentalmente gigante e mantém a resposta do Discord legível.
+        if len(pares) > 50:
             return await interaction.response.send_message(
-                f"Cap. **{cap['numero']}** de `{row_obra['sigla']}` já está fechado. "
-                f"Quem tem o cargo de fechar pode usar `/reabrir`.",
-                ephemeral=True,
+                "Você pode registrar no máximo 50 capítulos por comando.", ephemeral=True
             )
 
-        acao, antiga = await self.bot.db.set_etapa(  # type: ignore
-            cap["id"], tipo, interaction.user.id, str(interaction.user)
-        )
-        etapas = await self.bot.db.get_etapas(cap["id"])  # type: ignore
-        completa = await self.bot.db.etapas_completas(cap["id"])  # type: ignore
+        resultados: list[tuple[str, str, str]] = []
+        fechados: list[str] = []
+        erros: list[str] = []
 
-        extra_bits = []
-        if criado:
-            extra_bits.append(f"Capítulo **{cap['numero']}** aberto.")
-        if acao == "trocada" and antiga and antiga["user_id"] != interaction.user.id:
-            extra_bits.append(
-                f"`{tipo}` era de <@{antiga['user_id']}> e foi assumido por {interaction.user.mention}."
+        for obra_query, numeros in pares:
+            row_obra = await self.bot.db.get_obra(  # type: ignore
+                interaction.guild.id, obra_query
             )
-        else:
-            extra_bits.append(
-                f"{interaction.user.mention} marcou **{ETAPA_NOMES[tipo]}** (`{tipo}`)."
+            if not row_obra:
+                for numero in numeros:
+                    erros.append(f"`{obra_query}` cap. **{numero}**: obra não encontrada")
+                continue
+
+            if row_obra["status"] != "ativa":
+                for numero in numeros:
+                    erros.append(
+                        f"`{row_obra['sigla']}` cap. **{numero}**: obra pausada"
+                    )
+                continue
+
+            for numero in numeros:
+                try:
+                    cap_row, criado = await self.bot.db.get_or_create_cap(  # type: ignore
+                        row_obra["id"], numero, interaction.user.id
+                    )
+                    if cap_row["status"] == "fechado":
+                        erros.append(
+                            f"`{row_obra['sigla']}` cap. **{cap_row['numero']}**: já fechado"
+                        )
+                        continue
+
+                    acao, antiga = await self.bot.db.set_etapa(  # type: ignore
+                        cap_row["id"], tipo, interaction.user.id, str(interaction.user)
+                    )
+
+                    completa = await self.bot.db.etapas_completas(cap_row["id"])  # type: ignore
+                    status = cap_row["status"]
+
+                    if completa and AUTO_FECHAR:
+                        await self.bot.db.fechar_cap(cap_row["id"])  # type: ignore
+                        status = "fechado"
+                        fechados.append(
+                            f"{row_obra['sigla']} #{cap_row['numero']}"
+                        )
+
+                    if criado:
+                        acao_txt = "aberto + etapa marcada"
+                    elif acao == "trocada" and antiga and antiga["user_id"] != interaction.user.id:
+                        acao_txt = f"etapa assumida de <@{antiga['user_id']}>"
+                    else:
+                        acao_txt = "etapa marcada"
+
+                    resultados.append(
+                        (row_obra["sigla"], str(cap_row["numero"]), acao_txt)
+                    )
+                except Exception as exc:
+                    erros.append(
+                        f"`{row_obra['sigla']}` cap. **{numero}**: erro ao registrar ({exc})"
+                    )
+
+        linhas: list[str] = []
+        if resultados:
+            linhas.append(
+                f"### {ETAPA_NOMES[tipo]} (`{tipo}`) registrada em {len(resultados)} capítulo(s)"
+            )
+            # Agrupa visualmente por obra.
+            por_obra: dict[str, list[tuple[str, str]]] = {}
+            for sigla, numero, acao_txt in resultados:
+                por_obra.setdefault(sigla, []).append((numero, acao_txt))
+            for sigla, caps in por_obra.items():
+                caps_txt = ", ".join(f"**{n}** ({a})" for n, a in caps)
+                linhas.append(f"`{sigla}` → {caps_txt}")
+
+        if fechados:
+            linhas.append(
+                "\n**Fechados automaticamente:** "
+                + ", ".join(f"`{x}`" for x in fechados)
             )
 
-        fechou = False
-        if completa and AUTO_FECHAR:
-            await self.bot.db.fechar_cap(cap["id"])  # type: ignore
-            cap = dict(cap)
-            cap["status"] = "fechado"
-            fechou = True
-            extra_bits.append("Todas as etapas prontas — capítulo **fechado automaticamente**.")
-        elif completa:
-            extra_bits.append(
-                "Todas as etapas prontas. Quem tem o cargo de fechar pode usar `/fechar`."
+        if erros:
+            linhas.append(
+                "\n**Não registrados:**\n" + "\n".join(f"• {x}" for x in erros)
             )
 
-        embed = embed_capitulo(
-            row_obra["nome"],
-            row_obra["sigla"],
-            cap["numero"],
-            cap["status"],
-            etapas,
-            extra=" ".join(extra_bits),
-        )
-        await interaction.response.send_message(embed=embed)
+        if not linhas:
+            linhas.append("Nenhum capítulo foi registrado.")
 
-        if fechou:
-            await interaction.followup.send(
-                f"Cap. **{cap['numero']}** de **{row_obra['sigla']}** finalizado."
-            )
+        texto = "\n".join(linhas)
+        # Limite confortável para a mensagem do Discord.
+        if len(texto) > 4000:
+            texto = texto[:3950] + "\n… (resposta truncada)"
+
+        await interaction.response.send_message(texto)
+
+    @staticmethod
+    def _parse_lote_cap(obra: str, capitulo: str | None) -> list[tuple[str, list[str]]]:
+        """
+        Aceita:
+          OP + 101
+          OP + 101,102,103
+          OP,NAR + 101,102       -> aplica cada capítulo a cada obra
+          OP:101,102;NAR:5,6     -> obras com capítulos diferentes
+          OP:101,102 | NAR:5,6   -> mesma sintaxe usando |
+        """
+        obra = (obra or "").strip()
+        capitulo = (capitulo or "").strip()
+
+        if not obra:
+            raise ValueError("informe a obra.")
+
+        # Formato explícito para várias obras com capítulos diferentes.
+        if ":" in obra:
+            grupos = re.split(r"[;|]+", obra)
+            pares: list[tuple[str, list[str]]] = []
+            for grupo in grupos:
+                grupo = grupo.strip()
+                if not grupo:
+                    continue
+                if ":" not in grupo:
+                    raise ValueError(
+                        "mistura inválida. Use `OP:101,102;NAR:5,6`."
+                    )
+                nome, caps_txt = grupo.split(":", 1)
+                nome = nome.strip()
+                caps = Capitulos._split_caps(caps_txt)
+                if not nome or not caps:
+                    raise ValueError(
+                        "cada grupo deve ser `OBRA:CAP1,CAP2`."
+                    )
+                pares.append((nome, caps))
+            return Capitulos._dedup_pares(pares)
+
+        obras = [x.strip() for x in re.split(r"[,;|]+", obra) if x.strip()]
+        caps = Capitulos._split_caps(capitulo)
+
+        if not caps:
+            raise ValueError("informe o capítulo, por exemplo `101,102,103`.")
+
+        # Várias obras sem mapeamento explícito: aplica todos os caps a todas as obras.
+        return Capitulos._dedup_pares([(o, caps) for o in obras])
+
+    @staticmethod
+    def _split_caps(valor: str) -> list[str]:
+        return list(dict.fromkeys(
+            x.strip() for x in re.split(r"[,\s]+", valor or "") if x.strip()
+        ))
+
+    @staticmethod
+    def _dedup_pares(pares: list[tuple[str, list[str]]]) -> list[tuple[str, list[str]]]:
+        vistos: set[tuple[str, str]] = set()
+        saida: list[tuple[str, list[str]]] = []
+        for obra, caps in pares:
+            novos: list[str] = []
+            for cap in caps:
+                chave = (obra.casefold(), cap)
+                if chave not in vistos:
+                    vistos.add(chave)
+                    novos.append(cap)
+            if novos:
+                saida.append((obra, novos))
+        return saida
 
     @cap.autocomplete("obra")
     async def cap_obra_ac(self, interaction: discord.Interaction, current: str):
+        # Autocomplete continua útil para uso simples. Em lote, digite a sintaxe manualmente.
         return await self._obra_autocomplete(interaction, current)
 
     @cap.autocomplete("etapa")
